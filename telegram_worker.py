@@ -101,15 +101,50 @@ def _new_job(phone_count: int) -> str:
         "phone_count": phone_count,
         "message": "Queued, waiting for worker slot",
         "error": None,
-        "result_bytes": None,   # raw bytes returned by the bot (CSV or ZIP)
-        "result_type": None,    # "csv" | "zip" | "unknown"
+        "result_bytes": None,   # raw bytes returned by the bot (JSON or ZIP)
+        "result_type": None,    # "json" | "zip" | "unknown"
         "created_at": time.time(),
+        "confirmed": False,     # True once we clicked the bot's Confirm button
+        "recoverable": False,   # True if failure happened after bot produced results
+        "bot_username": None,   # set on recoverable failure for admin recovery
+        "failed_at": None,      # epoch seconds when failure was detected
     }
     return job_id
 
 
 def get_job(job_id: str) -> Optional[dict]:
     return jobs.get(job_id)
+
+
+def clear_job(job_id: str) -> bool:
+    """Remove a job from the store. Returns True if it existed."""
+    return jobs.pop(job_id, None) is not None
+
+
+def is_busy() -> Optional[dict]:
+    """Return the active job dict if any job is in flight or awaiting retrieval, else None."""
+    if not jobs:
+        return None
+    return next(iter(jobs.values()))
+
+
+async def submit_manual_result(job_id: str, result_bytes: bytes, result_type: str) -> bool:
+    """Admin-provided result for a job stuck in recoverable failure. Marks it done."""
+    job = jobs.get(job_id)
+    if job is None:
+        return False
+    job["status"] = "done"
+    job["message"] = "Result provided via manual recovery"
+    job["result_bytes"] = result_bytes
+    job["result_type"] = result_type
+    job["error"] = None
+    job["recoverable"] = False
+    return True
+
+
+class ServiceBusyError(Exception):
+    """Raised by enqueue_job when a previous job still occupies the single worker slot."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +185,18 @@ async def enqueue_job(phones: list[str], country_code: str = DEFAULT_COUNTRY_COD
     """
     Normalise phones to include country code, then add to the serial queue.
     Returns job_id immediately.
+
+    Enforces strict single-job occupancy: raises ServiceBusyError if any
+    previous job is still active OR is done/failed but awaiting caller retrieval.
+    Caller must fetch /result (success), DELETE the job (abandon), or upload a
+    manual result before submitting a new batch.
     """
+    active = is_busy()
+    if active is not None:
+        raise ServiceBusyError(
+            f"Service is busy: job {active['job_id']} is in state '{active['status']}'. "
+            "Fetch its result, DELETE it, or provide a manual result before submitting a new batch."
+        )
     normalised = [normalize_phone(p, country_code) for p in phones]
     job_id = _new_job(len(normalised))
     await _job_queue.put((job_id, normalised))
@@ -208,10 +254,26 @@ async def _process_job(job_id: str, phones: list[str]):
             job["error"] = f"Bot rejected the request: {e}"
             logger.error("[%s] bot rejected: %s", job_id, e)
             return
+        except _DownloadRecoveryError as e:
+            job["status"] = "failed"
+            job["error"] = str(e)
+            job["recoverable"] = True
+            job["bot_username"] = BOT_USERNAME
+            job["failed_at"] = time.time()
+            logger.error("[%s] recoverable failure — bot has results: %s", job_id, e)
+            return
         except asyncio.TimeoutError:
             job["status"] = "failed"
             job["error"] = f"Timed out after {JOB_TIMEOUT}s waiting for bot reply"
-            logger.error("[%s] timed out", job_id)
+            # If we got as far as clicking Confirm, the bot is probably holding results
+            # we never retrieved. Flag as recoverable so an admin can manually pull them.
+            if job.get("confirmed"):
+                job["recoverable"] = True
+                job["bot_username"] = BOT_USERNAME
+                job["failed_at"] = time.time()
+                logger.error("[%s] timed out after confirm — recoverable", job_id)
+            else:
+                logger.error("[%s] timed out before confirm", job_id)
             return
 
     result_bytes, result_type = result_bytes
@@ -223,6 +285,11 @@ async def _process_job(job_id: str, phones: list[str]):
 
 
 class _BotRejectedError(Exception):
+    pass
+
+
+class _DownloadRecoveryError(Exception):
+    """Bot produced a result but we failed to download it — admin can recover manually."""
     pass
 
 
@@ -283,12 +350,15 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
             )
             if confirm_btn:
                 job["message"] = "Clicking Confirm..."
+                confirmed = True  # set BEFORE await to avoid race with incoming progress messages
+                job["confirmed"] = True
                 try:
                     await confirm_btn.click()
-                    confirmed = True
                     job["message"] = "Confirmed — waiting for search to complete..."
                     logger.info("[%s] clicked Confirm: %r", job_id, confirm_btn.text)
                 except Exception as e:
+                    confirmed = False
+                    job["confirmed"] = False
                     logger.warning("[%s] Confirm click failed: %s", job_id, e)
                     reply_future.set_result(("rejected", f"Could not click Confirm: {e}"))
             elif all_buttons:
@@ -305,14 +375,16 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
         )
         if download_btn:
             job["message"] = "Search complete — clicking Download Results..."
+            downloaded = True  # set BEFORE await to avoid race with incoming upload progress messages
             try:
                 await download_btn.click()
-                downloaded = True
                 job["message"] = "Downloading results from bot..."
                 logger.info("[%s] clicked Download Results: %r", job_id, download_btn.text)
             except Exception as e:
+                downloaded = False
                 logger.warning("[%s] Download click failed: %s", job_id, e)
-                reply_future.set_result(("rejected", f"Could not click Download Results: {e}"))
+                # Bot has results ready; our click failed → recoverable
+                reply_future.set_result(("download_failed", f"Could not click Download Results: {e}"))
         # Otherwise progress update — keep waiting
 
     @_client.on(events.NewMessage(chats=bot_entity))
@@ -341,6 +413,9 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
         if kind == "rejected":
             raise _BotRejectedError(payload)
 
+        if kind == "download_failed":
+            raise _DownloadRecoveryError(payload)
+
         # kind == "document" — detect file type from mime_type or filename
         result_type = _detect_result_type(payload.document)
         logger.info("[%s] bot document: mime=%s filename=%s → type=%s",
@@ -349,8 +424,21 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
                     _get_filename(payload.document),
                     result_type)
 
-        result_bytes = await payload.download_media(bytes)
-        return result_bytes, result_type
+        # Retry download_media up to 2 attempts — transient network errors shouldn't
+        # strand a result that's already sitting on Telegram's servers.
+        last_err = None
+        for attempt in range(1, 3):
+            try:
+                result_bytes = await payload.download_media(bytes)
+                return result_bytes, result_type
+            except Exception as e:
+                last_err = e
+                logger.warning("[%s] download_media attempt %d/2 failed: %s", job_id, attempt, e)
+                if attempt < 2:
+                    await asyncio.sleep(3)
+        raise _DownloadRecoveryError(
+            f"Bot sent result file but download_media failed after 2 attempts: {last_err}"
+        )
 
     finally:
         _client.remove_event_handler(_on_new_message, events.NewMessage)

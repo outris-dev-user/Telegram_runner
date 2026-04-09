@@ -134,7 +134,22 @@ async def submit_lookup(
             detail=f"Batch too large: {len(phones)} phones (max 100,000)",
         )
 
-    job_id = await worker.enqueue_job(phones, country_code=country_code)
+    try:
+        job_id = await worker.enqueue_job(phones, country_code=country_code)
+    except worker.ServiceBusyError as exc:
+        active = worker.is_busy()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "service_busy",
+                "message": str(exc),
+                "active_job": {
+                    "job_id": active["job_id"],
+                    "status": active["status"],
+                    "recoverable": active.get("recoverable", False),
+                } if active else None,
+            },
+        )
     logger.info("Accepted job %s with %d phones", job_id, len(phones))
     return {"job_id": job_id}
 
@@ -163,7 +178,8 @@ async def get_job_status(job_id: str):
         "phone_count": job["phone_count"],
         "message": job["message"],
         "error": job["error"],
-        "result_type": job.get("result_type"),  # "csv" | "zip" | "unknown" | null (while running)
+        "result_type": job.get("result_type"),  # "json" | "zip" | "unknown" | null (while running)
+        "recoverable": job.get("recoverable", False),
     }
 
 
@@ -198,16 +214,56 @@ async def get_job_result(job_id: str):
     if status == "done":
         result_type = job.get("result_type") or "unknown"
         media_type, ext = _RESULT_TYPE_META.get(result_type, _RESULT_TYPE_META["unknown"])
+        content = job["result_bytes"]
+        # Auto-clear the slot on successful retrieval — caller has the data,
+        # service is free to accept the next batch.
+        worker.clear_job(job_id)
+        logger.info("Served and cleared job %s (%d bytes, %s)", job_id, len(content), result_type)
         return Response(
-            content=job["result_bytes"],
+            content=content,
             media_type=media_type,
             headers={"Content-Disposition": f'attachment; filename="{job_id}{ext}"'},
         )
 
     if status == "failed":
+        if job.get("recoverable"):
+            # Keep the job around so an admin can POST a manually-fetched result
+            # to /lookup/{job_id}/manual-result. Surface everything the upstream
+            # email pipeline needs to notify admin@outris.com with clear next steps.
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "job_failed_recoverable",
+                    "message": job["error"],
+                    "recovery": {
+                        "action": "manual_fetch_from_bot",
+                        "bot_username": job.get("bot_username"),
+                        "failed_at": job.get("failed_at"),
+                        "phone_count": job["phone_count"],
+                        "job_id": job_id,
+                        "manual_upload_endpoint": f"/lookup/{job_id}/manual-result",
+                        "abandon_endpoint": f"/lookup/{job_id}",
+                        "instructions": (
+                            f"The bot {job.get('bot_username')} produced a result for this batch of "
+                            f"{job['phone_count']} phones but telegram-runner could not download it "
+                            f"(details: {job['error']}). To recover: "
+                            f"(1) Open Telegram as the service account, find the most recent file reply "
+                            f"from {job.get('bot_username')}, and download it manually. "
+                            f"(2) POST the downloaded file to {f'/lookup/{job_id}/manual-result'} as a "
+                            f"multipart form field named 'file' (filename extension .json or .zip). "
+                            f"(3) Then GET /lookup/{job_id}/result to retrieve it as usual. "
+                            f"If the bot reply is gone or unrecoverable, DELETE /lookup/{job_id} to "
+                            f"free the service and re-submit the batch."
+                        ),
+                    },
+                },
+            )
+        # Non-recoverable failure — clear the slot and report
+        error = job["error"]
+        worker.clear_job(job_id)
         raise HTTPException(
             status_code=500,
-            detail={"error": "job_failed", "message": job["error"]},
+            detail={"error": "job_failed", "message": error},
         )
 
     # still in progress
@@ -219,6 +275,64 @@ async def get_job_result(job_id: str):
             "message": job["message"],
         },
     )
+
+
+@app.post("/lookup/{job_id}/manual-result", dependencies=[Depends(require_api_key)])
+async def submit_manual_result(job_id: str, file: UploadFile = File(...)):
+    """
+    Admin recovery endpoint: upload a result file (JSON or ZIP) that was
+    manually fetched from the bot, to complete a job stuck in recoverable
+    failure state. After a successful upload, the job moves to 'done' and
+    the caller can GET /lookup/{job_id}/result as normal.
+
+    Only valid when the job's current state is failed + recoverable=true.
+    """
+    job = worker.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not (job["status"] == "failed" and job.get("recoverable")):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not in recoverable failure state (status={job['status']}, "
+                   f"recoverable={job.get('recoverable', False)})",
+        )
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
+
+    filename = (file.filename or "").lower()
+    if filename.endswith(".zip"):
+        result_type = "zip"
+    elif filename.endswith(".json"):
+        result_type = "json"
+    else:
+        result_type = "unknown"
+
+    ok = await worker.submit_manual_result(job_id, content, result_type)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to apply manual result")
+
+    logger.info("Manual result applied to job %s (%d bytes, %s)", job_id, len(content), result_type)
+    return {
+        "job_id": job_id,
+        "status": "done",
+        "bytes": len(content),
+        "result_type": result_type,
+    }
+
+
+@app.delete("/lookup/{job_id}", dependencies=[Depends(require_api_key)])
+async def delete_job(job_id: str):
+    """
+    Abandon/acknowledge a job, freeing the single worker slot so the next
+    batch can be submitted. Use this after reading a failed/recoverable job's
+    error details if you don't intend to recover it.
+    """
+    if not worker.clear_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    logger.info("Cleared job %s via explicit DELETE", job_id)
+    return {"job_id": job_id, "cleared": True}
 
 
 @app.get("/health")
