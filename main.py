@@ -76,6 +76,7 @@ def require_api_key(request: Request):
 async def submit_lookup(
     file: Optional[UploadFile] = File(default=None),
     phones_json: Optional[str] = Form(default=None),
+    country_code: str = Form(default="91"),
 ):
     """
     Submit a batch of phones for lookup.
@@ -83,6 +84,18 @@ async def submit_lookup(
     Two input modes (pick one):
       1. Multipart file upload — CSV with a single column of phone numbers (no header).
       2. JSON body via form field `phones_json` — '["9876543210", ...]'
+
+    Optional:
+      country_code — digits only, default "91" (India). Applied to any number
+                     that doesn't already have a country code (i.e. 10-digit numbers).
+
+    Phone normalisation applied automatically:
+      - Strips +, spaces, dashes
+      - 10-digit numbers get country_code prepended → 12-digit
+      - Numbers already 12+ digits are left as-is
+
+    Bot minimum: 100 phones. Smaller batches will fail immediately with an
+    informative error (use the per-phone fallback API for those).
 
     Returns: { "job_id": "<uuid>" }
     """
@@ -121,7 +134,7 @@ async def submit_lookup(
             detail=f"Batch too large: {len(phones)} phones (max 100,000)",
         )
 
-    job_id = await worker.enqueue_job(phones)
+    job_id = await worker.enqueue_job(phones, country_code=country_code)
     logger.info("Accepted job %s with %d phones", job_id, len(phones))
     return {"job_id": job_id}
 
@@ -150,18 +163,31 @@ async def get_job_status(job_id: str):
         "phone_count": job["phone_count"],
         "message": job["message"],
         "error": job["error"],
+        "result_type": job.get("result_type"),  # "csv" | "zip" | "unknown" | null (while running)
     }
+
+
+_RESULT_TYPE_META = {
+    "csv":     ("text/csv",          ".csv"),
+    "zip":     ("application/zip",   ".zip"),
+    "unknown": ("application/octet-stream", ".bin"),
+}
 
 
 @app.get("/lookup/{job_id}/result", dependencies=[Depends(require_api_key)])
 async def get_job_result(job_id: str):
     """
-    Download the raw JSON the bot returned.
+    Download the raw file the bot returned (CSV or ZIP).
 
-    Returns 200 with application/json body when job is done.
+    Returns 200 with correct Content-Type when job is done:
+      - text/csv        for CSV replies
+      - application/zip for ZIP replies (bot sends ZIP when result is large)
     Returns 202 Accepted with status body when job is still running.
     Returns 404 if job not found.
     Returns 500 if job failed.
+
+    Callers should check the Content-Type (or the result_type field from GET
+    /lookup/{job_id}) to know which format to parse.
     """
     job = worker.get_job(job_id)
     if job is None:
@@ -170,10 +196,12 @@ async def get_job_result(job_id: str):
     status = job["status"]
 
     if status == "done":
+        result_type = job.get("result_type") or "unknown"
+        media_type, ext = _RESULT_TYPE_META.get(result_type, _RESULT_TYPE_META["unknown"])
         return Response(
             content=job["result_bytes"],
-            media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{job_id}.json"'},
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{job_id}{ext}"'},
         )
 
     if status == "failed":
