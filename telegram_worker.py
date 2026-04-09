@@ -244,8 +244,7 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
     confirmed = False   # True after we clicked Confirm
     downloaded = False  # True after we clicked Download Results
 
-    @_client.on(events.NewMessage(chats=bot_entity))
-    async def _on_message(event):
+    async def _handle_bot_event(event):
         nonlocal confirmed, downloaded
 
         if reply_future.done():
@@ -258,10 +257,9 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
             return
 
         text_lower = event.text.lower()
-        logger.info("[%s] bot text (confirmed=%s downloaded=%s): %s",
-                    job_id, confirmed, downloaded, event.text[:300])
+        logger.info("[%s] bot event type=%s confirmed=%s downloaded=%s: %s",
+                    job_id, type(event).__name__, confirmed, downloaded, event.text[:300])
 
-        # After clicking Download Results, ignore progress text — only waiting for document
         if downloaded:
             return
 
@@ -294,16 +292,14 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
                     logger.warning("[%s] Confirm click failed: %s", job_id, e)
                     reply_future.set_result(("rejected", f"Could not click Confirm: {e}"))
             elif all_buttons:
-                # Buttons present but no Confirm — rejection before search started
                 logger.warning("[%s] no Confirm button — rejection: %s", job_id, button_texts)
                 reply_future.set_result(("rejected", event.text))
             else:
-                # Plain text, no buttons — check hard rejection phrases
                 if any(phrase in text_lower for phrase in _BOT_REJECTION_PHRASES):
                     reply_future.set_result(("rejected", event.text))
             return
 
-        # --- Stage 2: confirmed, search running — look for Download Results button ---
+        # --- Stage 2: confirmed — look for Download Results button (new or edited message) ---
         download_btn = next(
             (b for b in all_buttons if b.text and "download" in b.text.lower()), None
         )
@@ -317,7 +313,15 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
             except Exception as e:
                 logger.warning("[%s] Download click failed: %s", job_id, e)
                 reply_future.set_result(("rejected", f"Could not click Download Results: {e}"))
-        # Otherwise it's a progress update — log already done above, keep waiting
+        # Otherwise progress update — keep waiting
+
+    @_client.on(events.NewMessage(chats=bot_entity))
+    async def _on_new_message(event):
+        await _handle_bot_event(event)
+
+    @_client.on(events.MessageEdited(chats=bot_entity))
+    async def _on_edited_message(event):
+        await _handle_bot_event(event)
 
     try:
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -349,7 +353,8 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
         return result_bytes, result_type
 
     finally:
-        _client.remove_event_handler(_on_message, events.NewMessage)
+        _client.remove_event_handler(_on_new_message, events.NewMessage)
+        _client.remove_event_handler(_on_edited_message, events.MessageEdited)
 
 
 def _detect_result_type(document) -> str:
