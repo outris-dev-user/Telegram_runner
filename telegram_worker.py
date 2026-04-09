@@ -282,14 +282,14 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
 
 
 def _detect_result_type(document) -> str:
-    """Classify bot document as 'csv', 'zip', or 'unknown'."""
+    """Classify bot document as 'json', 'zip', or 'unknown'."""
     mime = getattr(document, "mime_type", "") or ""
     filename = _get_filename(document).lower()
 
     if mime in ("application/zip", "application/x-zip-compressed") or filename.endswith(".zip"):
         return "zip"
-    if mime in ("text/csv", "text/plain", "application/csv") or filename.endswith(".csv"):
-        return "csv"
+    if mime in ("application/json", "text/plain") or filename.endswith(".json"):
+        return "json"
     return "unknown"
 
 

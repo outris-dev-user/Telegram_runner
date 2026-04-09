@@ -168,7 +168,7 @@ async def get_job_status(job_id: str):
 
 
 _RESULT_TYPE_META = {
-    "csv":     ("text/csv",          ".csv"),
+    "json":    ("application/json",  ".json"),
     "zip":     ("application/zip",   ".zip"),
     "unknown": ("application/octet-stream", ".bin"),
 }
