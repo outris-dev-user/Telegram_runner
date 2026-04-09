@@ -10,10 +10,10 @@ rare. No DB needed.
 Config (env vars):
     TELEGRAM_API_ID
     TELEGRAM_API_HASH
-    SESSION_PATH              path to .session file (without extension)
+    TELEGRAM_SESSION_STRING       string session from auth.py (preferred, no volume needed)
     TELEGRAM_LOOKUP_BOT_USERNAME  e.g. @SomeDataBot
-    JOB_TIMEOUT_SECONDS       default 1800 (30 min)
-    BOT_REPLY_POLL_INTERVAL   seconds between inbox checks (default 5)
+    JOB_TIMEOUT_SECONDS           default 1800 (30 min)
+    BOT_REPLY_POLL_INTERVAL       seconds between inbox checks (default 5)
 """
 
 import asyncio
@@ -29,6 +29,7 @@ from typing import Dict, Optional
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
-SESSION_PATH = os.environ.get("SESSION_PATH", "/data/telegram_session")
+SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 BOT_USERNAME = os.environ["TELEGRAM_LOOKUP_BOT_USERNAME"]
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "1800"))
 POLL_INTERVAL = int(os.environ.get("BOT_REPLY_POLL_INTERVAL", "5"))
@@ -76,13 +77,17 @@ _client: Optional[TelegramClient] = None
 async def start_worker():
     """Initialise the Telethon client and start the serial worker loop."""
     global _client
-    _client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-    # connect() without interactive auth — session file must already exist
+    if not SESSION_STRING:
+        raise RuntimeError(
+            "TELEGRAM_SESSION_STRING env var is not set. "
+            "Run auth.py locally to generate it, then set it on Railway."
+        )
+    _client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await _client.connect()
     if not await _client.is_user_authorized():
         raise RuntimeError(
-            "Telegram session not authorised. Run auth.py locally first, "
-            "then upload the .session file to the Railway volume."
+            "Telegram session string is invalid or expired. "
+            "Re-run auth.py locally to generate a fresh session string."
         )
     me = await _client.get_me()
     logger.info("Telegram client ready — logged in as %s (id=%s)", me.username, me.id)
