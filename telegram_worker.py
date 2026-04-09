@@ -256,29 +256,41 @@ async def _send_and_wait(job_id: str, csv_bytes: bytes, deadline: float) -> tupl
         text_lower = event.text.lower()
         logger.info("[%s] bot text reply: %s", job_id, event.text[:300])
 
-        # Bot sent a prompt with inline buttons — check for Confirm vs Cancel-only
-        if event.buttons:
-            all_buttons = [btn for row in event.buttons for btn in row]
-            button_texts = [btn.text.strip() for btn in all_buttons if btn.text]
+        # Bot sent a prompt — check for inline buttons
+        # Use get_buttons() (async) to ensure reply_markup is fully fetched
+        buttons = event.buttons
+        if buttons is None:
+            try:
+                buttons = await event.get_buttons()
+            except Exception:
+                buttons = None
+
+        if buttons:
+            all_buttons = [btn for row in buttons for btn in row]
+            button_texts = [repr(btn.text) for btn in all_buttons if btn.text]
             logger.info("[%s] bot buttons: %s", job_id, button_texts)
 
-            confirm_btn = next((b for b in all_buttons if b.text and b.text.strip().lower() == "confirm"), None)
+            # Use 'in' match so emoji/whitespace variations still match
+            confirm_btn = next(
+                (b for b in all_buttons if b.text and "confirm" in b.text.lower()),
+                None
+            )
 
             if confirm_btn:
                 job["message"] = "Bot requested confirmation — clicking Confirm..."
                 try:
                     await confirm_btn.click()
-                    logger.info("[%s] clicked Confirm button", job_id)
+                    logger.info("[%s] clicked Confirm button: %r", job_id, confirm_btn.text)
                 except Exception as e:
                     logger.warning("[%s] failed to click Confirm button: %s", job_id, e)
                     reply_future.set_result(("rejected", f"Could not click Confirm button: {e}"))
             else:
-                # Only Cancel (or no Confirm) — bot rejected the batch
-                logger.warning("[%s] no Confirm button found, bot rejected: %s", job_id, event.text[:300])
+                # Only Cancel present — bot rejected the batch
+                logger.warning("[%s] no Confirm button found (buttons: %s), treating as rejection", job_id, button_texts)
                 reply_future.set_result(("rejected", event.text))
             return
 
-        # Plain text rejection (no buttons)
+        # Plain text, no buttons — check for hard rejection phrases
         if any(phrase in text_lower for phrase in _BOT_REJECTION_PHRASES):
             reply_future.set_result(("rejected", event.text))
 
