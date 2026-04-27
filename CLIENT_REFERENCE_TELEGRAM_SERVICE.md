@@ -248,7 +248,38 @@ GET /health
 { "status": "ok" }
 ```
 
-No auth required.
+No auth required. Cheap — does not touch Telegram. Use this for load-balancer / Railway healthchecks.
+
+---
+
+### GET /status — deep readiness check
+
+Verifies the Telegram client is connected, the session is still authorised, and the configured bot username can be resolved. One Telegram API round-trip per call — **do not** poll this on a tight loop.
+
+```http
+GET /status
+X-API-Key: <key>
+```
+
+**Response 200 — healthy**
+
+```json
+{
+  "healthy": true,
+  "client_connected": true,
+  "client_authorized": true,
+  "session_user": { "id": 123456789, "username": "your_account" },
+  "bot_username": "@LookupBot",
+  "bot_reachable": true,
+  "bot_info": { "id": 987654321, "username": "LookupBot", "first_name": "Lookup Bot" },
+  "active_job": null,
+  "error": null
+}
+```
+
+**Response 503 — unhealthy**
+
+Returned when any of `client_connected`, `client_authorized`, or `bot_reachable` is false. The `error` field carries the reason (e.g. `"Telegram session is not authorised — re-run auth.py"` or a Telethon exception string). `active_job` is populated whenever a job currently occupies the slot.
 
 ---
 

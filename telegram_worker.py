@@ -13,7 +13,7 @@ Config (env vars):
     TELEGRAM_SESSION_STRING       string session from auth.py (preferred, no volume needed)
     TELEGRAM_LOOKUP_BOT_USERNAME  e.g. @SomeDataBot
     DEFAULT_COUNTRY_CODE          digits only, default "91" (India)
-    BOT_MIN_PHONES                minimum phones the bot accepts, default 100
+    BOT_MIN_PHONES                minimum phones the bot accepts, default 101
     JOB_TIMEOUT_SECONDS           default 1800 (30 min)
     BOT_REPLY_POLL_INTERVAL       seconds between inbox checks (default 5)
 """
@@ -43,7 +43,7 @@ API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 BOT_USERNAME = os.environ["TELEGRAM_LOOKUP_BOT_USERNAME"]
 DEFAULT_COUNTRY_CODE = os.environ.get("DEFAULT_COUNTRY_CODE", "91")
-BOT_MIN_PHONES = int(os.environ.get("BOT_MIN_PHONES", "100"))
+BOT_MIN_PHONES = int(os.environ.get("BOT_MIN_PHONES", "101"))
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "1800"))
 
 # Text fragments in plain-text (no-button) replies that indicate a hard rejection
@@ -179,6 +179,63 @@ async def stop_worker():
     global _client
     if _client:
         await _client.disconnect()
+
+
+async def health_check() -> dict:
+    """
+    Deep status probe: verify the Telethon client is connected, the session is
+    still authorised, and the configured bot username can be resolved. Used by
+    the /status endpoint — do not call from the Railway liveness check (would
+    cost a Telegram API hit on every poll and risks flood-waits).
+    """
+    info: dict = {
+        "client_connected": False,
+        "client_authorized": False,
+        "session_user": None,
+        "bot_username": BOT_USERNAME,
+        "bot_reachable": False,
+        "bot_info": None,
+        "active_job": None,
+        "error": None,
+    }
+
+    if _client is None:
+        info["error"] = "Telethon client is not initialised"
+        return info
+
+    try:
+        info["client_connected"] = _client.is_connected()
+        if not info["client_connected"]:
+            info["error"] = "Telethon client is not connected"
+            return info
+
+        info["client_authorized"] = await _client.is_user_authorized()
+        if not info["client_authorized"]:
+            info["error"] = "Telegram session is not authorised — re-run auth.py"
+            return info
+
+        me = await _client.get_me()
+        info["session_user"] = {"id": me.id, "username": me.username}
+
+        bot_entity = await _client.get_entity(BOT_USERNAME)
+        info["bot_reachable"] = True
+        info["bot_info"] = {
+            "id": bot_entity.id,
+            "username": getattr(bot_entity, "username", None),
+            "first_name": getattr(bot_entity, "first_name", None),
+        }
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+
+    active = is_busy()
+    if active is not None:
+        info["active_job"] = {
+            "job_id": active["job_id"],
+            "status": active["status"],
+            "phone_count": active["phone_count"],
+        }
+
+    return info
 
 
 async def enqueue_job(phones: list[str], country_code: str = DEFAULT_COUNTRY_CODE) -> str:

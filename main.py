@@ -94,7 +94,7 @@ async def submit_lookup(
       - 10-digit numbers get country_code prepended → 12-digit
       - Numbers already 12+ digits are left as-is
 
-    Bot minimum: 100 phones. Smaller batches will fail immediately with an
+    Bot minimum: 101 phones. Smaller batches will fail immediately with an
     informative error (use the per-phone fallback API for those).
 
     Returns: { "job_id": "<uuid>" }
@@ -338,3 +338,24 @@ async def delete_job(job_id: str):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/status", dependencies=[Depends(require_api_key)])
+async def status():
+    """
+    Deep status probe — verifies the Telegram client is connected, the session
+    is still authorised, and the configured bot username can be resolved.
+    Returns 200 when everything is healthy, 503 when any check fails.
+    Heavier than /health (one Telegram API round-trip), so do not point a
+    load-balancer healthcheck at this endpoint.
+    """
+    info = await worker.health_check()
+    healthy = (
+        info["client_connected"]
+        and info["client_authorized"]
+        and info["bot_reachable"]
+    )
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"healthy": healthy, **info},
+    )

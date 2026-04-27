@@ -12,11 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# /data is where the Railway volume will be mounted (holds the .session file)
-RUN mkdir -p /data
-
 ENV PYTHONUNBUFFERED=1
-ENV SESSION_PATH=/data/telegram_session
 
 EXPOSE 8080
 
